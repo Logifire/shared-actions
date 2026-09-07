@@ -1,0 +1,94 @@
+name: Shared AI PR Reviewer
+
+on:
+  workflow_call:
+    secrets:
+      OPENROUTER_API_KEY:
+        required: true
+
+jobs:
+  review:
+    # ONLY run if the action is 'labeled', the label is 'ai-review', and YOU are the actor
+    if: |
+      github.event.action == 'labeled' && 
+      github.event.label.name == 'ai-review' && 
+      github.actor == 'Logifire'
+    
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Get PR Diff
+        id: get_diff
+        run: |
+          diff=$(gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }})
+          EOF=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+          echo "diff<<$EOF" >> $GITHUB_OUTPUT
+          echo "$diff" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Call AI API (With Retry if Down)
+        id: ai_call
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 2
+          max_attempts: 3
+          retry_on: error
+          command: |
+            # Build the JSON payload safely using a specific free model
+            JSON_PAYLOAD=$(jq -n \
+              --arg diff "$RAW_DIFF" \
+              '{
+                model: "openrouter/free",
+                messages: [
+                  {role: "system", content: "You are an expert senior software engineer. Review this pull request diff and provide constructive feedback on bugs, security issues, performance improvements, and clean code principles in English."},
+                  {role: "user", content: $diff}
+                ]
+              }')
+
+            # Call OpenRouter with required headers to prevent HTML/Cloudflare blocks
+            RESPONSE=$(curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -H "HTTP-Referer: https://github.com/${{ github.repository }}" \
+              -H "X-Title: GitHub Actions PR Reviewer" \
+              -d "$JSON_PAYLOAD")
+            
+            # Verify if the response contains a valid message content before proceeding
+            TEXT=$(echo "$RESPONSE" | jq -e '.choices[0].message.content')
+            if [ $? -ne 0 ]; then
+              echo "Error: Failed to fetch a valid response from the AI API. Response was:"
+              echo "$RESPONSE"
+              exit 1
+            fi
+            
+            EOF=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+            echo "review<<$EOF" >> $GITHUB_OUTPUT
+            echo "$RESPONSE" | jq -r '.choices[0].message.content' >> $GITHUB_OUTPUT
+            echo "$EOF" >> $GITHUB_OUTPUT
+        env:
+          API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          RAW_DIFF: ${{ steps.get_diff.outputs.diff }}
+
+      - name: Comment on PR
+        uses: thollander/actions-comment-pull-request@v3
+        with:
+          message: |
+            ### 🤖 AI Code Review
+            ${{ steps.ai_call.outputs.review }}
+          comment_tag: ai_code_review
+
+      - name: Remove ai-review Label
+        if: always()
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} --remove-label "ai-review"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
